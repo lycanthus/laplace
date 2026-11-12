@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drum Membrane — Laplace Mode Simulator</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#151020;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#eee}
+  #c{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:grab}
+  #c.dragging{cursor:grabbing}
+  .hud{position:fixed;left:16px;top:14px;pointer-events:none;text-shadow:0 1px 4px #000}
+  .hud h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.3px}
+  .hud p{margin:5px 0 0;font-size:12.5px;opacity:.72;max-width:340px;line-height:1.45}
+  .panel{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);display:flex;flex-wrap:wrap;gap:9px;align-items:center;justify-content:center;
+    background:rgba(24,20,36,.84);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.13);border-radius:14px;padding:10px 14px;max-width:calc(100% - 20px);box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  button{background:#6d4aff;border:none;color:#fff;padding:7px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600}
+  button:hover{background:#7e5dff}
+  button.ghost{background:rgba(255,255,255,.10)}
+  button.mode{background:rgba(109,74,255,.22);font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:500;padding:7px 9px}
+  button.mode:hover{background:rgba(109,74,255,.45)}
+  button.mode.active{background:#6d4aff}
+  .sep{width:1px;height:22px;background:rgba(255,255,255,.16)}
+  label{font-size:12.5px;display:flex;align-items:center;gap:5px;white-space:nowrap;opacity:.92;cursor:pointer}
+  input[type=range]{width:80px;accent-color:#6d4aff}
+  input[type=checkbox]{accent-color:#6d4aff}
+  #weights{position:fixed;right:16px;top:14px;background:rgba(24,20,36,.78);border:1px solid rgba(255,255,255,.13);border-radius:10px;
+    padding:9px 13px;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;line-height:1.65;display:none;pointer-events:none;max-width:290px}
+  #weights b{color:#b9a6ff}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+  <h1>Circular Membrane · Laplace Mode Simulator</h1>
+  <p><b>Click the drum to strike it.</b> Drag to orbit &middot; scroll to zoom.<br>
+  Nodal lines appear only for the modes currently ringing, fading as their amplitude decays.</p>
+</div>
+<div id="weights"></div>
+<div class="panel">
+  <button id="strike">&#9889; Strike</button>
+  <span class="sep"></span>
+  <span id="modeBtns" style="display:flex;gap:5px;flex-wrap:wrap"></span>
+  <span class="sep"></span>
+  <label>Time &times;<input type="range" id="speed" min="0.05" max="1" step="0.01" value="0.05"></label>
+  <label>Amp &times;<input type="range" id="boost" min="1" max="6" step="0.1" value="1"></label>
+  <label>Damping <input type="range" id="damp" min="0.05" max="1.5" step="0.01" value="1.5"></label>
+  <label><input type="checkbox" id="sound" checked>Sound</label>
+  <label><input type="checkbox" id="spin" checked>Spin</label>
+  <label><input type="checkbox" id="nodes" checked>Nodal lines</label>
+  <button class="ghost" id="reset">Reset</button>
+</div>
+<script>
+"use strict";
+
+/* ============ Bessel J_m (power series) ============ */
+function besselJ(m, x){
+  const half = x/2;
+  let factM = 1; for (let i = 2; i <= m; i++) factM *= i;
+  let term = Math.pow(half, m) / factM, sum = 0;
+  for (let k = 0; k < 30; k++){
+    sum += (k % 2 ? -1 : 1) * term;
+    term *= (half*half) / ((k+1) * (k+m+1));
+  }
+  return sum;
+}
+
+/* ============ Eigenmodes (m, n, beta = zero of J_m) ============ */
+const MODES = [
+  [0,1,2.40483],[1,1,3.83171],[2,1,5.13562],[0,2,5.52008],
+  [1,2,7.01559],[3,1,6.38016],[2,2,8.41724],[0,3,8.65373]
+];
+const ROOTS = {0:[2.40483,5.52008,8.65373], 1:[3.83171,7.01559], 2:[5.13562,8.41724], 3:[6.38016]};
+const F0 = 72;
+const freqOf = b => F0 * b / 2.40483;
+const TAU = Math.PI*2;
+
+/* ============ Polar solution grids, one per mode ============ */
+const MS = 256;
+const NR2 = 96, NA2 = 180;
+const SG = MODES.map(md=>{
+  const m = md[0], b = md[2];
+  const g = new Float32Array((NR2+1)*NA2);
+  for (let ir=0; ir<=NR2; ir++){
+    const r = ir/NR2;
+    const Jb = besselJ(m, b*r);
+    for (let ia=0; ia<NA2; ia++){
+      g[ir*NA2+ia] = Jb * Math.cos(m*ia/NA2*TAU);
+    }
+  }
+  return g;
+});
+
+/* map-space pixel precomputation (the "texture canvas" domain) */
+const NPX = MS*MS;
+const active = new Uint8Array(NPX);
+const pIr0 = new Int32Array(NPX), pIr1 = new Int32Array(NPX), pFr = new Float32Array(NPX);
+const pIa0 = new Int32Array(NPX), pFa = new Float32Array(NPX);
+const grain = new Float32Array(NPX);
+(function bakePixels(){
+  const cc = MS/2, sc = (MS/2)*0.985;
+  for (let py=0; py<MS; py++){
+    for (let px=0; px<MS; px++){
+      const i = py*MS+px;
+      const dx = (px+0.5-cc)/sc, dy = (py+0.5-cc)/sc;
+      const r = Math.hypot(dx, dy);
+      const hx = Math.sin(px*127.1 + py*311.7 + 74.7)*43758.5453;
+      const hn = hx - Math.floor(hx);
+      grain[i] = 0.88 + 0.24*hn;
+      if (hn > 0.965) grain[i] *= 0.55;
+      if (r > 1){ active[i]=0; continue; }
+      active[i]=1;
+      const rf = Math.min(r,1)*NR2;
+      let ir0 = Math.floor(rf); if (ir0 > NR2-1) ir0 = NR2-1;
+      pIr0[i]=ir0; pIr1[i]=ir0+1; pFr[i]=rf-ir0;
+      let a = Math.atan2(dy,dx); if (a<0) a+=TAU;
+      const af = a/TAU*NA2;
+      pIa0[i]=Math.floor(af)%NA2; pFa[i]=af-Math.floor(af);
+    }
+  }
+})();
+
+/* ============ Simulation state ============ */
+let strikes = [];
+let gamma = 0.3;
+const uF = new Float32Array(NPX);
+let maxU = 0, lastFrameT = null;
+
+function updateField(t){
+  if (lastFrameT === null) lastFrameT = t;
+  const dt = Math.min(Math.max(t - lastFrameT, 0), 0.06);
+  lastFrameT = t;
+  const speed = parseFloat(document.getElementById('speed').value);
+  const boost = parseFloat(document.getElementById('boost').value);
+  for (const s of strikes){
+    s.phi += s.om * speed * dt;
+    const age = t - s.t0;
+    s.cur = s.amp * boost * Math.exp(-gamma*age) * Math.sin(s.phi);
+  }
+  strikes = strikes.filter(s => (t - s.t0) < 20 && Math.abs(s.cur) > 1e-3);
+  maxU = 0;
+  uF.fill(0);
+  for (const s of strikes){
+    const g = SG[s.mi], w = s.cur;
+    for (let i=0; i<NPX; i++){
+      if (!active[i]) continue;
+      const b0 = pIr0[i]*NA2, b1 = pIr1[i]*NA2;
+      const ia0 = pIa0[i], ia1 = ia0+1<NA2 ? ia0+1 : 0;
+      const fr = pFr[i], fa = pFa[i];
+      uF[i] += w * ((g[b0+ia0]*(1-fr) + g[b1+ia0]*fr)*(1-fa) +
+                    (g[b0+ia1]*(1-fr) + g[b1+ia1]*fr)*fa);
+    }
+  }
+  for (let i=0; i<NPX; i++){
+    const a = Math.abs(uF[i]);
+    if (a > maxU) maxU = a;
+  }
+}
+
+function sampleU(r, th){
+  let a = th % TAU; if (a < 0) a += TAU;
+  const rf = Math.min(Math.max(r,0),1)*NR2;
+  let ir0 = Math.floor(rf); if (ir0 > NR2-1) ir0 = NR2-1;
+  const fr = rf - ir0;
+  const af = a/TAU*NA2;
+  const ia0 = Math.floor(af)%NA2, ia1 = ia0+1<NA2 ? ia0+1 : 0;
+  const fa = af - Math.floor(af);
+  let u = 0;
+  for (const s of strikes){
+    const g = SG[s.mi], b0 = ir0*NA2, b1 = (ir0+1)*NA2;
+    u += s.cur * ((g[b0+ia0]*(1-fr) + g[b1+ia0]*fr)*(1-fa) +
+                  (g[b0+ia1]*(1-fr) + g[b1+ia1]*fr)*fa);
+  }
+  return u;
+}
+
+function randomStrike(r0, th0){
+  r0 = Math.min(r0, 0.98);
+  const now = performance.now()/1000;
+  const ws = [];
+  MODES.forEach((md, mi)=>{
+    const s = besselJ(md[0], md[2]*r0) * Math.cos(md[0]*th0);
+    const amp = s * (0.75 + 0.25*Math.random()) * 1.15;
+    if (Math.abs(amp) > 0.02) ws.push({mi, amp, om:TAU*freqOf(md[2]), phi:0, t0:now, cur:0});
+  });
+  strikes = strikes.concat(ws).slice(-14);
+  showWeights(r0, th0, ws);
+  playSound(ws);
+}
+function pureStrike(mi){
+  const now = performance.now()/1000;
+  const md = MODES[mi];
+  strikes = [{mi, amp:1.1, om:TAU*freqOf(md[2]), phi:0, t0:now, cur:0}];
+  showWeights(0.71, 0, strikes, 'pure ('+md[0]+','+md[1]+')');
+  playSound(strikes);
+}
+function showWeights(r0, th0, ws, tag){
+  const el = document.getElementById('weights');
+  if (!ws.length){ el.style.display='none'; return; }
+  let mx = 0; for (const w of ws) mx = Math.max(mx, Math.abs(w.amp));
+  const top = ws.slice().sort((a,b)=>Math.abs(b.amp)-Math.abs(a.amp)).slice(0,4);
+  let html = tag ? '<b>'+tag+'</b><br>' : 'hit r='+r0.toFixed(2)+' &theta;='+th0.toFixed(2)+'<br>';
+  html += top.map(w=>'('+MODES[w.mi][0]+','+MODES[w.mi][1]+') '+Math.round(Math.abs(w.amp)/mx*100)+'%').join(' &nbsp; ');
+  el.innerHTML = html;
+  el.style.display='block';
+}
+
+/* ============ Texture painting (thermal + hillshade + grain, darkened) ============ */
+const mc = document.createElement('canvas'); mc.width = MS; mc.height = MS;
+const mctx = mc.getContext('2d');
+const mimg = mctx.createImageData(MS, MS);
+{ const d = mimg.data; for (let i=3; i<d.length; i+=4) d[i]=255; }
+
+const L = (()=>{ const l=[-0.45,-0.5,0.74]; const n=Math.hypot(l[0],l[1],l[2]); return [l[0]/n,l[1]/n,l[2]/n]; })();
+const LSLOPE = 55;
+const DARK = 0.5;   // global surface darkening (50%)
+
+function paintMap(){
+  const d = mimg.data;
+  for (let i=0; i<NPX; i++){
+    if (!active[i]){ const o=i*4; d[o]=22; d[o+1]=17; d[o+2]=33; continue; }
+  }
+  for (let py=1; py<MS-1; py++){
+    for (let px=1; px<MS-1; px++){
+      const i = py*MS+px;
+      if (!active[i]) continue;
+      const u = uF[i];
+      const gx = (uF[i+1]-uF[i-1])*LSLOPE;
+      const gy = (uF[i+MS]-uF[i-MS])*LSLOPE;
+      const nl = Math.hypot(gx, gy, 1);
+      const lam = (-gx*L[0] - gy*L[1] + L[2]) / nl;
+      const shade = 0.45 + 0.85*Math.max(0.08, lam);
+      const I = shade * grain[i] * DARK;
+      let dd = u/1.6; if (dd>1) dd=1; if (dd<-1) dd=-1;
+      let r,g,b;
+      if (dd>=0){ r=214+(240-214)*dd; g=195+(96-195)*dd; b=156+(48-156)*dd; }
+      else { const q=-dd; r=214+(80-214)*q; g=195+(86-195)*q; b=156+(235-156)*q; }
+      const o = i*4;
+      d[o]   = r*I>255?255:r*I;
+      d[o+1] = g*I>255?255:g*I;
+      d[o+2] = b*I>255?255:b*I;
+    }
+  }
+  mctx.putImageData(mimg, 0, 0);
+}
+
+/* ============ Main canvas & 3D layout ============ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W=0, Hh=0, DPR=1, cxm=0, cym=0, S=280;
+
+const c3 = document.createElement('canvas');
+const c3ctx = c3.getContext('2d');
+let c3img = null;
+const VH = 0.5;
+const UCAPV = 1.5;
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; Hh = window.innerHeight;
+  canvas.width = W*DPR; canvas.height = Hh*DPR;
+  S = Math.min(W,Hh)*0.36;
+  cxm = W*0.5; cym = Hh*0.47;
+  c3.width = Math.ceil(2*S+3);
+  c3.height = Math.ceil(S*(2+2*UCAPV)+4);
+  c3img = c3ctx.createImageData(c3.width, c3.height);
+}
+window.addEventListener('resize', resize); resize();
+
+let az = 0.8, alpha = 0.72;
+
+function P3(wx, wz, h, ca, sa, ps){
+  const xr = wx*ca + wz*sa;
+  const zr = -wx*sa + wz*ca;
+  return [cxm + S*xr, cym + S*(zr*ps - h*VH)];
+}
+
+function paint3D(){
+  const ca = Math.cos(az), sa = Math.sin(az), ps = Math.sin(alpha);
+  const data = c3img.data;
+  data.fill(0);
+  const md = mimg.data;
+  const cw = c3.width, ch = c3.height;
+  const A = ps + UCAPV;
+  const dz = 1/(S*Math.max(ps, 0.35));
+  const dxs = 1/S;
+  const sc = (MS/2)*0.985;
+
+  for (let zr=-1; zr<=1; zr+=dz){
+    const xMax = Math.sqrt(Math.max(0, 1-zr*zr));
+    const yOff = zr*ps;
+    for (let xp=-xMax; xp<=xMax; xp+=dxs){
+      const wx = xp*ca - zr*sa;
+      const wz = xp*sa + zr*ca;
+      const r2 = wx*wx + wz*wz;
+      if (r2 > 1) continue;
+      const r = Math.sqrt(r2);
+      let th = Math.atan2(wz, wx); if (th<0) th+=TAU;
+      let px = (MS/2 + sc*r*Math.cos(th) - 0.5)|0;
+      let py = (MS/2 + sc*r*Math.sin(th) - 0.5)|0;
+      if (px<0) px=0; else if (px>=MS) px=MS-1;
+      if (py<0) py=0; else if (py>=MS) py=MS-1;
+      const mi = py*MS+px;
+      if (!active[mi]) continue;
+      const u = uF[mi];
+      let dxx = ((xp+1)*S + 1)|0; if (dxx>=cw) dxx=cw-1;
+      let dyy = ((yOff - u*VH + A)*S + 1)|0; if (dyy>=ch) dyy=ch-1; if (dyy<0) dyy=0;
+      const o = mi*4, di = (dyy*cw + dxx)*4;
+      data[di]   = md[o];
+      data[di+1] = md[o+1];
+      data[di+2] = md[o+2];
+      data[di+3] = 255;
+    }
+  }
+  c3ctx.putImageData(c3img, 0, 0);
+}
+
+/* ============ Active nodal lines ============
+   Collect the currently ringing modes (largest amplitude first),
+   keep the strongest few, opacity tracks live amplitude. */
+function activeModes(){
+  const seen = new Map();
+  for (const s of strikes){
+    const prev = seen.get(s.mi) || 0;
+    if (Math.abs(s.cur) > prev) seen.set(s.mi, Math.abs(s.cur));
+  }
+  let mx = 0;
+  for (const v of seen.values()) if (v > mx) mx = v;
+  const arr = [];
+  for (const [mi, v] of seen){
+    if (mx > 0 && v/mx > 0.15) arr.push({mi, rel: v/mx});
+  }
+  arr.sort((a,b)=>b.rel-a.rel);
+  return arr.slice(0, 3);   // strongest 3 active modes
+}
+
+/* ============ Scene render ============ */
+let fps=0, frames=0, fpsT=0;
+
+function render(t){
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  const g = ctx.createRadialGradient(cxm,Hh*0.42,40, cxm,Hh*0.5,Math.max(W,Hh)*0.75);
+  g.addColorStop(0,'#241d38'); g.addColorStop(1,'#120e1c');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,Hh);
+
+  const ca = Math.cos(az), sa = Math.sin(az), ps = Math.sin(alpha);
+  const Hbot = -0.5;
+
+  /* ---- drum bottom cap ---- */
+  ctx.beginPath();
+  for (let k=0;k<=56;k++){
+    const th=k/56*TAU;
+    const p = P3(Math.cos(th), Math.sin(th), Hbot, ca, sa, ps);
+    k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);
+  }
+  ctx.fillStyle='rgb(28,20,14)'; ctx.fill();
+
+  /* ---- shell wall, far-to-near ---- */
+  const strips = [];
+  const nAng = 56;
+  for (let j=0;j<nAng;j++){
+    const t1=j/nAng*TAU, t2=(j+1)/nAng*TAU;
+    const zr1 = -Math.sin(t1)*sa + Math.cos(t1)*ca;
+    const zr2 = -Math.sin(t2)*sa + Math.cos(t2)*ca;
+    strips.push({t1,t2,zr:(zr1+zr2)/2});
+  }
+  strips.sort((a,b)=>a.zr-b.zr);
+  for (const st of strips){
+    const a1 = P3(Math.cos(st.t1), Math.sin(st.t1), 0, ca, sa, ps);
+    const a2 = P3(Math.cos(st.t2), Math.sin(st.t2), 0, ca, sa, ps);
+    const b1 = P3(Math.cos(st.t1), Math.sin(st.t1), Hbot, ca, sa, ps);
+    const b2 = P3(Math.cos(st.t2), Math.sin(st.t2), Hbot, ca, sa, ps);
+    const thm = (st.t1+st.t2)/2;
+    const lam = Math.abs(Math.cos(thm-az-0.9))*0.6+0.4;
+    ctx.beginPath();
+    ctx.moveTo(a1[0],a1[1]); ctx.lineTo(a2[0],a2[1]);
+    ctx.lineTo(b2[0],b2[1]); ctx.lineTo(b1[0],b1[1]);
+    ctx.closePath();
+    ctx.fillStyle='rgb('+Math.round(120*lam)+','+Math.round(85*lam)+','+Math.round(52*lam)+')';
+    ctx.fill();
+  }
+
+  /* ---- membrane: textured, lit, lifted in 3D ---- */
+  paint3D();
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(c3, cxm-S-1, cym + S*(-(ps+UCAPV)) - 1);
+
+  /* ---- rim highlight ---- */
+  ctx.beginPath();
+  for (let k=0;k<=72;k++){
+    const th=k/72*TAU;
+    const p = P3(Math.cos(th), Math.sin(th), 0, ca, sa, ps);
+    k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);
+  }
+  ctx.strokeStyle='rgba(255,235,205,0.55)'; ctx.lineWidth=2.2; ctx.stroke();
+
+  /* ---- wireframe cross-sections overlaid on the surface ---- */
+  ctx.lineJoin='round';
+  ctx.strokeStyle='rgba(225,210,255,0.9)';
+  ctx.lineWidth=1.5;
+  const NPROF=12, NPTS=26;
+  for (let q=0;q<NPROF;q++){
+    const th = q/NPROF*TAU;
+    ctx.beginPath();
+    for (let k=0;k<=NPTS;k++){
+      const r = k/NPTS;
+      const u = sampleU(r, th);
+      const p = P3(r*Math.cos(th), r*Math.sin(th), u, ca, sa, ps);
+      k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);
+    }
+    ctx.stroke();
+  }
+  ctx.strokeStyle='rgba(150,220,255,0.75)';
+  ctx.lineWidth=1.2;
+  for (const rr of [1/3, 2/3]){
+    ctx.beginPath();
+    for (let k=0;k<=64;k++){
+      const th = k/64*TAU;
+      const u = sampleU(rr, th);
+      const p = P3(rr*Math.cos(th), rr*Math.sin(th), u, ca, sa, ps);
+      k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);
+    }
+    ctx.stroke();
+  }
+
+  /* ---- nodal lines: ONLY for modes currently ringing ---- */
+  if (document.getElementById('nodes').checked){
+    const act = activeModes();
+    if (act.length){
+      ctx.save();
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([7,6]);
+      for (const am of act){
+        const md = MODES[am.mi];
+        const m = md[0], b = md[2];
+        const op = 0.25 + 0.65*am.rel;
+        ctx.strokeStyle = 'rgba(255,255,255,'+op.toFixed(2)+')';
+        for (const rt of ROOTS[m]){
+          if (rt >= b-1e-3) break;
+          const rc = rt/b;
+          ctx.beginPath();
+          for (let k=0;k<=64;k++){
+            const th=k/64*TAU;
+            const p = P3(rc*Math.cos(th), rc*Math.sin(th), 0, ca, sa, ps);
+            k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);
+          }
+          ctx.stroke();
+        }
+        for (let k=0;k<m;k++){
+          const th = (2*k+1)*Math.PI/(2*m);
+          const c1 = Math.cos(th), s1 = Math.sin(th);
+          ctx.beginPath();
+          let p = P3(-c1, -s1, 0, ca, sa, ps);
+          ctx.moveTo(p[0],p[1]);
+          p = P3(c1, s1, 0, ca, sa, ps);
+          ctx.lineTo(p[0],p[1]);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
+
+  /* ---- diagnostics ---- */
+  frames++;
+  if (t-fpsT>1){ fps=frames; frames=0; fpsT=t; }
+  ctx.fillStyle='rgba(255,255,255,0.55)';
+  ctx.font='12px monospace';
+  const names = activeModes().map(a=>'('+MODES[a.mi][0]+','+MODES[a.mi][1]+')').join(' ');
+  ctx.fillText('fps '+fps+'   max disp '+maxU.toFixed(3)+'   ringing: '+(names||'—'), 14, Hh-16);
+}
+
+/* ============ Audio ============ */
+let actx=null, master=null;
+function ensureAudio(){
+  if (actx) return;
+  try{
+    actx = new (window.AudioContext||window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value=0.5; master.connect(actx.destination);
+  }catch(e){ actx=null; }
+}
+function playSound(ws){
+  const snd = document.getElementById('sound');
+  if (snd && !snd.checked) return;
+  ensureAudio(); if (!actx) return;
+  if (actx.state==='suspended') actx.resume();
+  const top = ws.slice().sort((a,b)=>Math.abs(b.amp)-Math.abs(a.amp)).slice(0,5);
+  const now = actx.currentTime;
+  for (const s of top){
+    const f = s.om/TAU * (1+(Math.random()-0.5)*0.004);
+    const gn = actx.createGain();
+    gn.gain.setValueAtTime(0.0001, now);
+    gn.gain.exponentialRampToValueAtTime(Math.min(0.16, 0.10*Math.abs(s.amp)), now+0.008);
+    gn.gain.exponentialRampToValueAtTime(0.0001, now+1.6+2.2*Math.abs(s.amp));
+    const o = actx.createOscillator();
+    o.type='sine'; o.frequency.value=f;
+    o.connect(gn); gn.connect(master);
+    o.start(now); o.stop(now+4);
+  }
+}
+
+/* ============ Interaction ============ */
+let dragging=false, moved=0, lx=0, ly=0;
+canvas.addEventListener('pointerdown', e=>{
+  dragging=true; moved=0; lx=e.clientX; ly=e.clientY;
+  try{ canvas.setPointerCapture(e.pointerId); }catch(err){}
+  canvas.classList.add('dragging');
+  ensureAudio();
+});
+canvas.addEventListener('pointermove', e=>{
+  if (!dragging) return;
+  const dx=e.clientX-lx, dy=e.clientY-ly;
+  moved += Math.abs(dx)+Math.abs(dy);
+  lx=e.clientX; ly=e.clientY;
+  az += dx*0.008;
+  alpha = Math.max(0.28, Math.min(1.42, alpha + dy*0.006));
+});
+canvas.addEventListener('pointerup', e=>{
+  dragging=false; canvas.classList.remove('dragging');
+  if (moved < 6){
+    const ps = Math.sin(alpha);
+    if (ps < 0.1) return;
+    const xr = (e.clientX-cxm)/S;
+    const zr = (e.clientY-cym)/(S*ps);
+    const ca = Math.cos(az), sa = Math.sin(az);
+    const wx = xr*ca - zr*sa;
+    const wz = xr*sa + zr*ca;
+    const r = Math.hypot(wx, wz);
+    if (r <= 1.03){
+      randomStrike(Math.min(r,0.97), Math.atan2(wz, wx));
+    }
+  }
+});
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  S = Math.max(140, Math.min(Math.min(W,Hh)*0.42, S*(e.deltaY>0?0.93:1.07)));
+  c3.width = Math.ceil(2*S+3);
+  c3.height = Math.ceil(S*(2+2*UCAPV)+4);
+  c3img = c3ctx.createImageData(c3.width, c3.height);
+},{passive:false});
+
+/* ============ UI ============ */
+const modeBtns = document.getElementById('modeBtns');
+MODES.forEach((md,mi)=>{
+  const b=document.createElement('button');
+  b.className='mode'; b.textContent='('+md[0]+','+md[1]+')';
+  b.title='Strike the pure mode ('+md[0]+','+md[1]+')';
+  b.onclick=()=>{ pureStrike(mi); setActiveBtn(b); };
+  modeBtns.appendChild(b);
+});
+function setActiveBtn(btn){
+  [...modeBtns.children].forEach(b=>b.classList.toggle('active', b===btn));
+}
+document.getElementById('strike').onclick=()=>{
+  randomStrike(Math.sqrt(Math.random())*0.95, Math.random()*TAU);
+  setActiveBtn(null);
+};
+document.getElementById('damp').oninput=e=>gamma=parseFloat(e.target.value);
+document.getElementById('reset').onclick=()=>{
+  strikes=[];
+  document.getElementById('weights').style.display='none';
+  setActiveBtn(null);
+};
+
+/* ============ Main loop ============ */
+let errored=false;
+setTimeout(()=>randomStrike(0.35, 0.5), 600);
+(function loop(){
+  requestAnimationFrame(loop);
+  if (errored) return;
+  try{
+    const t = performance.now()/1000;
+    if (document.getElementById('spin').checked && !dragging) az += 0.004;
+    updateField(t);
+    paintMap();
+    render(t);
+  }catch(err){
+    errored=true;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#151020'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#ff6b6b'; ctx.font='15px monospace';
+    ctx.fillText('Sim error: '+err.message, 20, 40);
+    if (err.stack) ctx.fillText(String(err.stack).split('\n')[1]||'', 20, 64);
+  }
+})();
+</script>
+</body>
+</html>
