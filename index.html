@@ -33,7 +33,7 @@
 <div class="hud">
   <h1>Circular Membrane · Laplace Mode Simulator</h1>
   <p><b>Click the drum to strike it.</b> Drag to orbit &middot; scroll to zoom.<br>
-  Nodal lines appear only for the modes currently ringing, fading as their amplitude decays.</p>
+  Z grad on: color = displacement (blue = down, red = up), auto-normalized. Off: neutral skin. Nodal lines show for modes currently ringing.</p>
 </div>
 <div id="weights"></div>
 <div class="panel">
@@ -41,9 +41,10 @@
   <span class="sep"></span>
   <span id="modeBtns" style="display:flex;gap:5px;flex-wrap:wrap"></span>
   <span class="sep"></span>
-  <label>Time &times;<input type="range" id="speed" min="0.05" max="1" step="0.01" value="0.05"></label>
+  <label>Time &times;<input type="range" id="speed" min="0.01" max="1" step="0.005" value="0.01"></label>
   <label>Amp &times;<input type="range" id="boost" min="1" max="6" step="0.1" value="1"></label>
-  <label>Damping <input type="range" id="damp" min="0.05" max="1.5" step="0.01" value="1.5"></label>
+  <label>Damping <input type="range" id="damp" min="0.05" max="3" step="0.01" value="3"></label>
+  <label><input type="checkbox" id="zgrad" checked>Z grad</label>
   <label><input type="checkbox" id="sound" checked>Sound</label>
   <label><input type="checkbox" id="spin" checked>Spin</label>
   <label><input type="checkbox" id="nodes" checked>Nodal lines</label>
@@ -121,7 +122,7 @@ const grain = new Float32Array(NPX);
 
 /* ============ Simulation state ============ */
 let strikes = [];
-let gamma = 0.3;
+let gamma = 3.0;
 const uF = new Float32Array(NPX);
 let maxU = 0, lastFrameT = null;
 
@@ -204,7 +205,7 @@ function showWeights(r0, th0, ws, tag){
   el.style.display='block';
 }
 
-/* ============ Texture painting (thermal + hillshade + grain, darkened) ============ */
+/* ============ Texture painting ============ */
 const mc = document.createElement('canvas'); mc.width = MS; mc.height = MS;
 const mctx = mc.getContext('2d');
 const mimg = mctx.createImageData(MS, MS);
@@ -212,32 +213,77 @@ const mimg = mctx.createImageData(MS, MS);
 
 const L = (()=>{ const l=[-0.45,-0.5,0.74]; const n=Math.hypot(l[0],l[1],l[2]); return [l[0]/n,l[1]/n,l[2]/n]; })();
 const LSLOPE = 55;
-const DARK = 0.5;   // global surface darkening (50%)
+const DARK = 0.5;   /* global surface darkening (50%) */
 
+/* Z-displacement color ramp: blue (low) -> neutral (rest) -> red (high) */
+const RAMP = [
+  [-1.00,  28,  50, 200],
+  [-0.55,  70, 150, 230],
+  [-0.18, 120, 150, 190],
+  [ 0.00, 132, 122, 112],
+  [ 0.18, 200, 170,  90],
+  [ 0.55, 240, 140,  60],
+  [ 1.00, 235,  55,  35]
+];
+function rampRGB(dd){
+  for (let k=0; k<RAMP.length-1; k++){
+    if (dd <= RAMP[k+1][0]){
+      const a = RAMP[k], b = RAMP[k+1];
+      const f = (dd - a[0]) / (b[0] - a[0]);
+      return [a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f, a[3]+(b[3]-a[3])*f];
+    }
+  }
+  return [235, 55, 35];
+}
+
+/* Neutral skin: constant base tone, NO displacement hue at all */
+const SKIN = [214, 195, 156];
+
+let lastGradState = null;
 function paintMap(){
   const d = mimg.data;
-  for (let i=0; i<NPX; i++){
-    if (!active[i]){ const o=i*4; d[o]=22; d[o+1]=17; d[o+2]=33; continue; }
+  const useGrad = document.getElementById('zgrad').checked;
+  /* full-buffer repaint whenever the toggle changes, so no stale pixels survive */
+  if (useGrad !== lastGradState){
+    lastGradState = useGrad;
+    for (let i=0; i<NPX; i++){
+      const o = i*4;
+      if (active[i]){
+        d[o]   = SKIN[0];
+        d[o+1] = SKIN[1];
+        d[o+2] = SKIN[2];
+      } else {
+        d[o]   = 22; d[o+1] = 17; d[o+2] = 33;
+      }
+    }
   }
-  for (let py=1; py<MS-1; py++){
-    for (let px=1; px<MS-1; px++){
+  /* normalization: gradient uses CURRENT extremes each frame */
+  const norm = 1.05 * Math.max(maxU, 0.12);
+  for (let py=0; py<MS; py++){
+    for (let px=0; px<MS; px++){
       const i = py*MS+px;
-      if (!active[i]) continue;
+      const o = i*4;
+      if (!active[i]){
+        d[o]=22; d[o+1]=17; d[o+2]=33;
+        continue;
+      }
       const u = uF[i];
-      const gx = (uF[i+1]-uF[i-1])*LSLOPE;
-      const gy = (uF[i+MS]-uF[i-MS])*LSLOPE;
+      const gx = (uF[py*MS + Math.min(px+1,MS-1)] - uF[py*MS + Math.max(px-1,0)])*LSLOPE;
+      const gy = (uF[Math.min(py+1,MS-1)*MS + px] - uF[Math.max(py-1,0)*MS + px])*LSLOPE;
       const nl = Math.hypot(gx, gy, 1);
       const lam = (-gx*L[0] - gy*L[1] + L[2]) / nl;
       const shade = 0.45 + 0.85*Math.max(0.08, lam);
       const I = shade * grain[i] * DARK;
-      let dd = u/1.6; if (dd>1) dd=1; if (dd<-1) dd=-1;
-      let r,g,b;
-      if (dd>=0){ r=214+(240-214)*dd; g=195+(96-195)*dd; b=156+(48-156)*dd; }
-      else { const q=-dd; r=214+(80-214)*q; g=195+(86-195)*q; b=156+(235-156)*q; }
-      const o = i*4;
-      d[o]   = r*I>255?255:r*I;
-      d[o+1] = g*I>255?255:g*I;
-      d[o+2] = b*I>255?255:b*I;
+      let c;
+      if (useGrad){
+        let dd = u/norm; if (dd>1) dd=1; if (dd<-1) dd=-1;
+        c = rampRGB(dd);
+      } else {
+        c = SKIN;
+      }
+      d[o]   = c[0]*I>255?255:c[0]*I;
+      d[o+1] = c[1]*I>255?255:c[1]*I;
+      d[o+2] = c[2]*I>255?255:c[2]*I;
     }
   }
   mctx.putImageData(mimg, 0, 0);
@@ -314,9 +360,7 @@ function paint3D(){
   c3ctx.putImageData(c3img, 0, 0);
 }
 
-/* ============ Active nodal lines ============
-   Collect the currently ringing modes (largest amplitude first),
-   keep the strongest few, opacity tracks live amplitude. */
+/* ============ Active nodal lines ============ */
 function activeModes(){
   const seen = new Map();
   for (const s of strikes){
@@ -330,7 +374,7 @@ function activeModes(){
     if (mx > 0 && v/mx > 0.15) arr.push({mi, rel: v/mx});
   }
   arr.sort((a,b)=>b.rel-a.rel);
-  return arr.slice(0, 3);   // strongest 3 active modes
+  return arr.slice(0, 3);
 }
 
 /* ============ Scene render ============ */
@@ -466,7 +510,7 @@ function render(t){
   ctx.fillStyle='rgba(255,255,255,0.55)';
   ctx.font='12px monospace';
   const names = activeModes().map(a=>'('+MODES[a.mi][0]+','+MODES[a.mi][1]+')').join(' ');
-  ctx.fillText('fps '+fps+'   max disp '+maxU.toFixed(3)+'   ringing: '+(names||'—'), 14, Hh-16);
+  ctx.fillText('fps '+fps+'   max disp '+maxU.toFixed(3)+'   ringing: '+(names||'\u2014'), 14, Hh-16);
 }
 
 /* ============ Audio ============ */
